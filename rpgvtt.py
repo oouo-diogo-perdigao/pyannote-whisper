@@ -6,11 +6,13 @@ import argparse
 import numpy as np
 import torch
 import pickle
+import threading
+from tqdm import tqdm
 from pathlib import Path
 from tabulate import tabulate
 from datetime import datetime
 from pynput import keyboard
-from typing import Literal, cast
+from typing import Literal, cast, List, Union
 from dotenv import load_dotenv
 from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
 from whisper.transcribe import transcribe
@@ -21,25 +23,173 @@ from whisper.utils import (
     optional_int,
     str2bool,
 )
-from pyannote_whisper.utils import diarize_text, write_to_txt
 from threading import Thread
 
 # Carrega as variáveis do arquivo .env
 load_dotenv()
 
-
-def salvar_objeto(objeto, caminho_arquivo):
-    """Salva um objeto Python em um arquivo .txt usando pickle."""
-    with open(caminho_arquivo, "wb") as arquivo:
-        pickle.dump(objeto, arquivo)
+# todo organizar codigo separando melhor as classes e funções
 
 
-def carregar_objeto(caminho_arquivo):
-    """Carrega um objeto Python de um arquivo .txt usando pickle."""
-    with open(caminho_arquivo, "rb") as arquivo:
-        return pickle.load(arquivo)
+# region (collapsed) Thread Progress Bar para o whisper
+class ProgressListener:
+    def on_progress(self, current: Union[int, float], total: Union[int, float]):
+        pass
+
+    def on_finished(self):
+        pass
 
 
+class ProgressListenerHandle:
+    def __init__(self, listener: ProgressListener):
+        self.listener = listener
+
+    def __enter__(self):
+        register_thread_local_progress_listener(self.listener)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        unregister_thread_local_progress_listener(self.listener)
+        if exc_type is None:
+            self.listener.on_finished()
+
+
+class _CustomProgressBar(tqdm):
+    def __init__(self, *args, **kwargs):
+        # Remove argumentos não reconhecidos
+        kwargs.pop("disable", None)
+        super().__init__(*args, **kwargs)
+        self._current = self.n
+        self.total = kwargs.get(
+            "total", 100
+        )  # Valor padrão para casos sem total definido
+
+    def update(self, n=1):
+        super().update(n)
+        self._current += n
+        listeners = _get_thread_local_listeners()
+        for listener in listeners:
+            # Normaliza o progresso para porcentagem
+            progress_percent = (self._current / self.total) * 100 if self.total else 0
+            listener.on_progress(progress_percent, 100)
+
+
+_thread_local = threading.local()
+
+
+def _get_thread_local_listeners():
+    if not hasattr(_thread_local, "listeners"):
+        _thread_local.listeners = []
+    return _thread_local.listeners
+
+
+_hooked = False
+
+
+def init_progress_hook():
+    global _hooked
+    if not _hooked:
+        import whisper.transcribe
+
+        # Substitui a referência direta da função tqdm no módulo
+        whisper.transcribe.tqdm = _CustomProgressBar
+        _hooked = True
+
+
+def register_thread_local_progress_listener(progress_listener: ProgressListener):
+    init_progress_hook()
+    listeners = _get_thread_local_listeners()
+    listeners.append(progress_listener)
+
+
+def unregister_thread_local_progress_listener(progress_listener: ProgressListener):
+    listeners = _get_thread_local_listeners()
+    if progress_listener in listeners:
+        listeners.remove(progress_listener)
+
+
+class TqdmProgressListener(ProgressListener):
+    def __init__(self, desc: str):
+        self.pbar = tqdm(
+            desc=desc,
+            unit="%",
+            ncols=80,
+            leave=False,
+            bar_format="{l_bar}{bar}| {n:.0f}%",
+        )
+
+    def on_progress(self, current: float, total: float):
+        self.pbar.n = current
+        self.pbar.total = total
+        self.pbar.refresh()
+
+    def on_finished(self):
+        self.pbar.n = 100
+        self.pbar.close()
+
+
+# endregion
+
+# region (collapsed) pyanoote
+from pyannote.core import Segment, Annotation, Timeline
+
+
+def get_text_with_timestamp(transcribe_res):
+    timestamp_texts = []
+    for item in transcribe_res["segments"]:
+        start = item["start"]
+        end = item["end"]
+        text = item["text"]
+        timestamp_texts.append((Segment(start, end), text))
+    return timestamp_texts
+
+
+def add_speaker_info_to_text(timestamp_texts, ann):
+    spk_text = []
+    for seg, text in timestamp_texts:
+        spk = ann.crop(seg).argmax()
+        spk_text.append((seg, spk, text))
+    return spk_text
+
+
+def merge_cache(text_cache):
+    sentence = "".join([item[-1] for item in text_cache])
+    spk = text_cache[0][1]
+    start = text_cache[0][0].start
+    end = text_cache[-1][0].end
+    return Segment(start, end), spk, sentence
+
+
+PUNC_SENT_END = [".", "?", "!"]
+
+
+def merge_sentence(spk_text):
+    merged_spk_text = []
+    pre_spk = None
+    text_cache = []
+    for seg, spk, text in spk_text:
+        if spk != pre_spk and pre_spk is not None and len(text_cache) > 0:
+            merged_spk_text.append(merge_cache(text_cache))
+            text_cache = [(seg, spk, text)]
+            pre_spk = spk
+
+        elif text and len(text) > 0 and text[-1] in PUNC_SENT_END:
+            text_cache.append((seg, spk, text))
+            merged_spk_text.append(merge_cache(text_cache))
+            text_cache = []
+            pre_spk = spk
+        else:
+            text_cache.append((seg, spk, text))
+            pre_spk = spk
+    if len(text_cache) > 0:
+        merged_spk_text.append(merge_cache(text_cache))
+    return merged_spk_text
+
+
+# endregion
+
+
+# region (collapsed) minha classe de controle
 class VttSpkGenerator:
     def __init__(
         self,
@@ -49,11 +199,15 @@ class VttSpkGenerator:
         output_format: Literal["txt", "vtt", "srt"] = "vtt",
         device="cuda",
         threads=0,
+        whisper=True,
+        pyannote=True,
     ):
         # uso interno
         self.skip = False
         self.listener = None
         self.process = None
+        self.whisper = whisper
+        self.pyannote = pyannote
 
         # parametros de pacotes
         self.language = language
@@ -63,19 +217,25 @@ class VttSpkGenerator:
             torch.set_num_threads(threads)
 
         # Inicia o carregamento dos modelos em threads separadas
-        thread_whisper = Thread(
-            target=self.carregar_modelo_whisper, args=(model, device)
-        )
-        thread_pyannote = Thread(
-            target=self.carregar_modelo_pyannote, args=(auth_token,)
-        )
+        if whisper:
+            thread_whisper = Thread(
+                target=self.carregar_modelo_whisper, args=(model, device)
+            )
+        if pyannote:
+            thread_pyannote = Thread(
+                target=self.carregar_modelo_pyannote, args=(auth_token,)
+            )
 
-        thread_whisper.start()
-        thread_pyannote.start()
+        if whisper:
+            thread_whisper.start()
+        if pyannote:
+            thread_pyannote.start()
 
         # Aguarda a conclusão das threads
-        thread_whisper.join()
-        thread_pyannote.join()
+        if whisper:
+            thread_whisper.join()
+        if pyannote:
+            thread_pyannote.join()
 
     def carregar_modelo_whisper(self, model, device):
         from whisper import load_model
@@ -126,26 +286,27 @@ class VttSpkGenerator:
                 self.listener = None
 
     def processar_vtt(self, mp3_path):
-        print(f"\n{'='*40}")
-        print(f"\n🔨 Iniciando transcrição... {self.output_format.upper()}")
-        print(f"📂 Pasta: {mp3_path.parent}")
-        print(f"🎧 Nome: {mp3_path.name}")
-        print(f"⏰ Modificado: {datetime.fromtimestamp(os.path.getmtime(mp3_path))}")
-        print(f"{'='*40}")
-
         try:
-            # cria a pasta de saída se não existir
+            if not self.whisper:
+                raise ValueError("Whisper não está habilitado")
             os.makedirs(mp3_path.parent, exist_ok=True)
 
-            transcribeResult = transcribe(
-                self.model,
-                str(mp3_path),
-                verbose=True,
-                # initial_prompt=None,
-                task="transcribe",
-                language=self.language,
+            # Configura a barra de progresso
+            progress_listener = TqdmProgressListener(
+                total=100,
+                desc=f"Transcrevendo {mp3_path.parent}/{mp3_path.name} para {self.output_format.upper()}",
             )
 
+            with ProgressListenerHandle(progress_listener):
+                transcribeResult = transcribe(
+                    self.model,
+                    str(mp3_path),
+                    verbose=False,  # Desativa o progresso padrão
+                    task="transcribe",
+                    language=self.language,
+                )
+
+            # Resto do código de salvamento...
             audio_basename = os.path.basename(mp3_path)
 
             if self.output_format == "txt":
@@ -173,8 +334,44 @@ class VttSpkGenerator:
                 ) as file:
                     WriteSRT(mp3_path.parent).write_result(transcribeResult, file=file)
 
+            return transcribeResult
+
+        except subprocess.CalledProcessError as e:
+            print(f"\n❌ Erro na transcrição: {str(e)}")
+            return None
+
+    # todo ajustar a diarização
+    def processar_spk(self, mp3_path, transcribeResult):
+        try:
+            if not self.whisper:
+                raise ValueError("Whisper não está habilitado")
             print(f"\n{'='*40}")
-            print(f"\n🔨 Transcrição Finalizada. {self.output_format.upper()}")
+            print(f"\n🔨 Iniciando diarização... .spk")
+            print(f"📂 Pasta: {mp3_path.parent}")
+            print(f"🎧 Nome: {mp3_path.name}")
+            print(
+                f"⏰ Modificado: {datetime.fromtimestamp(os.path.getmtime(mp3_path))}"
+            )
+            print(f"{'='*40}")
+
+            audio_basename = os.path.basename(mp3_path)
+            diarization_result = self.pipeline(mp3_path)
+
+            timestamp_texts = get_text_with_timestamp(transcribeResult)
+            spk_text = add_speaker_info_to_text(timestamp_texts, diarization_result)
+            res = merge_sentence(spk_text)
+
+            with open(
+                os.path.join(mp3_path.parent, audio_basename + ".spk"),
+                "w",
+                encoding="utf-8",
+            ) as file:
+                for seg, spk, sentence in res:
+                    line = f"{seg.start:.2f} {seg.end:.2f} {spk} {sentence}\n"
+                    file.write(line)
+
+            print(f"\n{'='*40}")
+            print(f"\n🔨 Diarização Finalizada. .spk")
             print(f"📂 Pasta: {mp3_path.parent}")
             print(f"🎧 Nome: {mp3_path.name}")
             print(
@@ -183,35 +380,15 @@ class VttSpkGenerator:
             print(f"\n✅ {self.output_format.upper()} criado: {mp3_path.name}")
             print(f"{'='*40}")
 
-            return transcribeResult
-
         except subprocess.CalledProcessError as e:
-            print(f"\n❌ Erro na transcrição: {str(e)}")
+            print(f"\n❌ Erro na Diarização: {str(e)}")
             return None
 
-    def processar_spk(self, mp3_path, transcribeResult):
-        print(f"\n{'='*40}")
-        print(f"\n🔨 Iniciando diarização... .spk")
-        print(f"📂 Pasta: {mp3_path.parent}")
-        print(f"🎧 Nome: {mp3_path.name}")
-        print(f"⏰ Modificado: {datetime.fromtimestamp(os.path.getmtime(mp3_path))}")
-        print(f"{'='*40}")
 
-        audio_basename = os.path.basename(mp3_path)
-        diarization_result = self.pipeline(mp3_path)
-        filepath = os.path.join(mp3_path.parent, audio_basename + ".spk")
-        res = diarize_text(transcribeResult, diarization_result)
-        write_to_txt(res, filepath)
-
-        print(f"\n{'='*40}")
-        print(f"\n🔨 Diarização Finalizada. .spk")
-        print(f"📂 Pasta: {mp3_path.parent}")
-        print(f"🎧 Nome: {mp3_path.name}")
-        print(f"⏰ Modificado: {datetime.fromtimestamp(os.path.getmtime(mp3_path))}")
-        print(f"\n✅ {self.output_format.upper()} criado: {mp3_path.name}")
-        print(f"{'='*40}")
+# endregion
 
 
+# region (collapsed) Funções auxiliares locais
 def listar_arquivos_mp3(pasta_base):
     mp3_files = []
 
@@ -280,6 +457,18 @@ def contar(mp3_files):
     return total, vtt, spk
 
 
+def salvar_objeto(objeto, caminho_arquivo):
+    """Salva um objeto Python em um arquivo .txt usando pickle."""
+    with open(caminho_arquivo, "wb") as arquivo:
+        pickle.dump(objeto, arquivo)
+
+
+def carregar_objeto(caminho_arquivo):
+    """Carrega um objeto Python de um arquivo .txt usando pickle."""
+    with open(caminho_arquivo, "rb") as arquivo:
+        return pickle.load(arquivo)
+
+
 def getArgs():
     from whisper import available_models
 
@@ -345,6 +534,9 @@ def getArgs():
     return parser.parse_args()
 
 
+# endregion
+
+
 def main():
     args = getArgs()
 
@@ -358,6 +550,8 @@ def main():
         output_format=args.output_format,
         device=args.device,
         threads=args.threads,
+        whisper=args.vtt,
+        pyannote=args.spk,
     )
 
     if (
@@ -368,12 +562,11 @@ def main():
 
         def spk_worker():
             while True:
-                mp3 = spk_queue.get()
-                if mp3 is None:
+                [mp3_path, transcribeResult] = spk_queue.get()
+                if mp3_path is None:
                     break
-                if mp3.with_suffix(".vtt").exists():
-                    controller.processar_spk(mp3)
-
+                if mp3_path.with_suffix(".process").exists():
+                    controller.processar_spk(mp3_path, transcribeResult)
                 spk_queue.task_done()
 
         thread_spk = Thread(target=spk_worker, daemon=True)
@@ -386,34 +579,35 @@ def main():
             pendentesSpk = [
                 f for f in mp3_files if not f.with_name(f"{f.stem}.spk").exists()
             ]
+
             for mp3_path in pendentesSpk:
-                if mp3_path.with_suffix(".txt").exists():
-                    # verifica se o .spk desses arquivos já foi criado
-                    if not mp3_path.with_name(f"{mp3_path.stem}.spk").exists():
-                        transcribeResult = carregar_objeto(
-                            mp3_path.with_suffix(".process")
-                        )
-                        spk_queue.put([mp3_path, transcribeResult])
+                if (
+                    mp3_path.with_suffix(".process").exists()
+                    and not mp3_path.with_name(f"{mp3_path.stem}.spk").exists()
+                ):
+                    transcribeResult = carregar_objeto(mp3_path.with_suffix(".process"))
+                    spk_queue.put([mp3_path, transcribeResult])
+                    print(f"📁 Arquivo {mp3_path.name} adicionado à fila")
 
         if args.vtt:
             pendentesVtt = [f for f in mp3_files if not f.with_suffix(".vtt").exists()]
-            for idx, mp3_path in enumerate(pendentesVtt, 1):
-                print(f"📁 Arquivo {idx}/{len(pendentesVtt)}")
 
-                transcribeResult = controller.processar_vtt(mp3_path)
+            with tqdm(
+                total=len(pendentesVtt), desc="Processando arquivos", unit="arquivo"
+            ) as main_pbar:
+                for idx, mp3_path in enumerate(pendentesVtt, 1):
+                    print(f"📁 Arquivo {idx}/{len(pendentesVtt)}")
 
-                # Salva o retorno do transcribe em um arquivo .txt
-                salvar_objeto(transcribeResult, mp3_path.with_suffix(".process"))
-
-                # toca o audio por 30 segundos para um feedback que foi concluido o vtt
-                controller.tocar_30_segundos(mp3_path)
-
-                if idx < len(pendentesVtt):
-                    ("Proximo arquivo")
-
-                if args.spk:
-                    if mp3_path.with_suffix(".vtt").exists():
+                    transcribeResult = controller.processar_vtt(mp3_path)
+                    if transcribeResult:
+                        salvar_objeto(
+                            transcribeResult, mp3_path.with_suffix(".process")
+                        )
+                        controller.tocar_30_segundos(mp3_path)
                         spk_queue.put([mp3_path, transcribeResult])
+                        print(f"📁 Arquivo {mp3_path.name} adicionado à fila")
+
+                    main_pbar.update(1)
 
         if args.spk:
             # Aguarda a conclusão da thread_spk antes de prosseguir

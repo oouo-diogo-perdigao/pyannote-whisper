@@ -18,6 +18,7 @@ No wsl Instalação, ja com o python 3.10 instalado
 - `pip install -U speechbrain pyannote.audio whisper`
 - `pip install "pytorch-lightning>=2.0.0"`
 - `pip install python-dotenv`
+- `pip install tqdm`
 
 	Acesse https://huggingface.co/settings/tokens
 	Crie um novo token com permissão de "write"
